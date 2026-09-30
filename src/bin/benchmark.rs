@@ -13,7 +13,8 @@ const RAW_TRACER: &str = "benchmark_results_tracer.csv";
 
 /// Per-operation statistics over every actor of a role and every
 /// successful run of each scenario.
-const SUMMARY: &str = "benchmark_results_summary.csv";
+/// Same columns as the baseline's `benchmark_results_summary.csv`.
+const SUMMARY: &str = "benchmark_summary.csv";
 
 fn create_csv(path: &str, header: &str) -> File {
     let mut file = OpenOptions::new()
@@ -103,7 +104,22 @@ fn main() {
     write_summary(&summarizer);
 
     println!("==================================================");
-    println!("   STARTING TAPS_TT BENCHMARK SUITE");
+    println!("   STARTING TAPS_TT_P (PARALLEL) BENCHMARK SUITE");
+    println!("==================================================");
+    let hardware = bench_config::Hardware::detect();
+    println!("{}", hardware.describe());
+    for scenario in &scenarios {
+        println!(
+            "Scenario n={} n3={}: rayon threads per tracer = {}",
+            scenario.n,
+            scenario.n3,
+            bench_config::tracer_thread_budget(
+                hardware.logical_cores,
+                scenario.n3,
+                hardware.rayon_env.as_deref()
+            )
+        );
+    }
     println!("==================================================");
 
     let status = Command::new("cargo")

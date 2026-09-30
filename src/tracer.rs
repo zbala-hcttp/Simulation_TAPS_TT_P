@@ -7,6 +7,7 @@ use crate::{
 use secp256k1::{Error, PublicKey, Scalar};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::time::Instant;
 use taps_tt_p::protocol::dkg::{self, DecryptionInput, DkgBroadcast, DkgParticipant, PartialDecryption, TracerKeyShare};
 use taps_tt_p::protocol::field::Fq;
 use taps_tt_p::protocol::group::Gt;
@@ -531,6 +532,15 @@ impl Tracer {
     /// publicly recomputed verification keys, recombines any `t_e` valid
     /// ones, and runs `Trace` to recover the quorum.
     pub fn combine_and_trace(&self, partials: Vec<PartialDecryption>) -> Result<Vec<usize>, String> {
+        self.combine_and_trace_timed(partials).map(|(quorum, _)| quorum)
+    }
+
+    /// [`Tracer::combine_and_trace`], additionally reporting the pure
+    /// cryptographic runtime of share verification and of Rec.
+    pub fn combine_and_trace_timed(
+        &self,
+        partials: Vec<PartialDecryption>,
+    ) -> Result<(Vec<usize>, TraceTimings), String> {
         let sigma = self.sigma.as_ref().ok_or("Sigma not set in Tracer")?;
         let v0 = self.v0.as_ref().ok_or("v0 not set in Tracer")?;
         let v1 = self.v_vec.as_ref().ok_or("v_vec not set in Tracer")?;
@@ -539,58 +549,126 @@ impl Tracer {
             .as_ref()
             .ok_or("DKG not finalized for this tracer")?;
         let te = self.te.ok_or("t_e not set")?;
-
-        let input = DecryptionInput::from_public_keys(&sigma.ct.c0, &sigma.ct.c1, v0, v1);
-
-        let mut valid: Vec<PartialDecryption> = Vec::with_capacity(partials.len());
-        for partial in partials {
-            let expected_vk = dkg::verification_key(&share.qual, &self.dkg_broadcasts, partial.tracer_index)?;
-            if dkg::verify_partial_decryption(&partial, &input, &expected_vk).is_ok() {
-                valid.push(partial);
-            } else {
-                eprintln!(
-                    "[Tracer] Partial decryption from tracer index {} is invalid, ignoring it",
-                    partial.tracer_index
-                );
-            }
-        }
-
-        let (g_z_prime, g_bits) = dkg::combine_partial_decryptions(&input, &valid, te)?;
-
-        let mut bits: Vec<u8> = Vec::with_capacity(g_bits.len());
-        for (i, g_bit) in g_bits.iter().enumerate() {
-            bits.push(dkg::decode_bit(g_bit, i)?);
-        }
-
+        let t = self.t.ok_or("Threshold t not set in Tracer")?;
         let pk = self.pk.as_ref().ok_or("PK not set in Tracer")?;
-        let quo = Quorum::set(pk, &bits);
-        let c = self.statement(sigma).c();
-        let g_z_expected = schnorr_signature(&sigma.R, &quo, &c);
 
-        if g_z_prime != Gt::from_public_key(&g_z_expected) {
-            return Err(
-                "Tracing failed: g^z from the decrypted quorum does not match the \
-                 decrypted signature."
-                    .to_string(),
+        let context = TraceContext {
+            input: DecryptionInput::from_public_keys(&sigma.ct.c0, &sigma.ct.c1, v0, v1),
+            qual: &share.qual,
+            broadcasts: &self.dkg_broadcasts,
+            te,
+            t,
+            pk,
+            R: &sigma.R,
+            c: self.statement(sigma).c(),
+        };
+        verify_and_trace(&context, partials)
+    }
+}
+
+/// Everything steps 9-13 of the tracing need, independent of the
+/// networking `Tracer`, so the single-tracer benchmark (`trace_bench`) runs
+/// exactly the same code as the tracer process.
+pub struct TraceContext<'a> {
+    /// `ct = (c0, c1)` and every `v_i = (v0_i, v1_i)`.
+    pub input: DecryptionInput,
+    /// Qualified set of the DKG.
+    pub qual: &'a [usize],
+    /// Round-1 DKG broadcasts, keyed by 1-based tracer index.
+    pub broadcasts: &'a BTreeMap<usize, DkgBroadcast>,
+    /// Tracer reconstruction threshold `t_e`.
+    pub te: usize,
+    /// Signer threshold `t`.
+    pub t: usize,
+    pub pk: &'a PK,
+    /// Aggregate nonce `R` carried in sigma.
+    pub R: &'a PublicKey,
+    /// Schnorr challenge `c`, re-derived from the statement.
+    pub c: Scalar,
+}
+
+/// Steps 9-13: verifies every partial decryption against the publicly
+/// recomputed verification keys (ShareVerify), recombines `t_e` valid ones,
+/// decodes the bits and checks `g^z` (Rec). Returns the traced quorum and
+/// the crypto-only timings of both parts.
+pub fn verify_and_trace(
+    context: &TraceContext,
+    partials: Vec<PartialDecryption>,
+) -> Result<(Vec<usize>, TraceTimings), String> {
+    let input: &DecryptionInput = &context.input;
+    let te: usize = context.te;
+    let t: usize = context.t;
+    let start_verify = Instant::now();
+    // Expected vk_k of every partial, recomputed from the DKG commitments:
+    // aggregated once, then one t_e-term evaluation per partial, in order.
+    let indices: Vec<usize> = partials.iter().map(|partial| partial.tracer_index).collect();
+    let expected_vks: Vec<Gt> =
+        dkg::verification_keys(context.qual, context.broadcasts, &indices)?;
+    // Every share and proof of every partial, as one flat parallel batch.
+    let verdicts = dkg::verify_partial_decryptions(&partials, input, &expected_vks);
+
+    let mut valid: Vec<PartialDecryption> = Vec::with_capacity(partials.len());
+    for (partial, verdict) in partials.into_iter().zip(verdicts) {
+        if verdict.is_ok() {
+            valid.push(partial);
+        } else {
+            eprintln!(
+                "[Tracer] Partial decryption from tracer index {} is invalid, ignoring it",
+                partial.tracer_index
             );
         }
-
-        let quorum: Vec<usize> = bits
-            .iter()
-            .enumerate()
-            .filter(|&(_, &b)| b == 1)
-            .map(|(i, _)| i)
-            .collect();
-
-        let t = self.t.ok_or("Threshold t not set in Tracer")?;
-        if quorum.len() < t {
-            return Err(format!(
-                "Tracing failed: quorum of {} signers is below the threshold t={}",
-                quorum.len(),
-                t
-            ));
-        }
-
-        Ok(quorum)
     }
+    let share_verify_us = start_verify.elapsed().as_micros();
+
+    let start_rec = Instant::now();
+    let (g_z_prime, g_bits) = dkg::combine_partial_decryptions(input, &valid, te)?;
+
+    let mut bits: Vec<u8> = Vec::with_capacity(g_bits.len());
+    for (i, g_bit) in g_bits.iter().enumerate() {
+        bits.push(dkg::decode_bit(g_bit, i)?);
+    }
+
+    let quo = Quorum::set(context.pk, &bits);
+    let g_z_expected = schnorr_signature(context.R, &quo, &context.c);
+
+    if g_z_prime != Gt::from_public_key(&g_z_expected) {
+        return Err(
+            "Tracing failed: g^z from the decrypted quorum does not match the \
+             decrypted signature."
+                .to_string(),
+        );
+    }
+
+    let quorum: Vec<usize> = bits
+        .iter()
+        .enumerate()
+        .filter(|&(_, &b)| b == 1)
+        .map(|(i, _)| i)
+        .collect();
+
+    if quorum.len() < t {
+        return Err(format!(
+            "Tracing failed: quorum of {} signers is below the threshold t={}",
+            quorum.len(),
+            t
+        ));
+    }
+    let rec_us = start_rec.elapsed().as_micros();
+
+    Ok((
+        quorum,
+        TraceTimings {
+            share_verify_us,
+            rec_us,
+        },
+    ))
+}
+
+/// Crypto-only sub-timings of the tracing step, in microseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceTimings {
+    /// Recomputing the expected `vk_k` and checking every share and proof.
+    pub share_verify_us: u128,
+    /// Rec: Lagrange recombination, bit decoding and the `g^z` check.
+    pub rec_us: u128,
 }

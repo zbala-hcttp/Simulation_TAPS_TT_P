@@ -1,4 +1,5 @@
 use simulation_taps_tt_p::{
+    bench_config,
     combiner::TracerPublicKeyPackage,
     network::{self, Message, Role},
     tracer::Tracer,
@@ -63,6 +64,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let n3 = tracer.n3.unwrap();
     let te = tracer.te.unwrap();
     println!("[Tracer #{}] n_3={} t_e={}", index, n3, te);
+
+    // Share the machine's cores among the n_3 co-located tracers (unless
+    // RAYON_NUM_THREADS is set). Nothing before this point uses rayon.
+    let rayon_threads = bench_config::apply_tracer_thread_budget(n3);
+    println!("[Tracer #{}] rayon threads: {}", index, rayon_threads);
 
     // =========================================================================
     // Phase 2: Combiner Interaction
@@ -197,8 +203,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Phase 5: Threshold decryption and tracing, among the tracers only
     // =========================================================================
 
+    // `VerifySign` keeps exactly the baseline boundaries (ShareDec, the
+    // exchange of partials over the mesh, verification and Rec). The
+    // `ShareDec`, `ShareVerify` and `Rec` rows are crypto-only sub-timings
+    // inside that window, with no network time in them.
     let start_partial = Instant::now();
     let own_partial = tracer.partial_decrypt();
+    let share_dec_us = start_partial.elapsed().as_micros();
 
     // Step 7: send our partial decryption, with its Chaum-Pedersen proofs,
     // to every other tracer, encrypted to that tracer.
@@ -222,10 +233,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut partials = tracer.open_peer_partials(items);
     partials.push(own_partial);
 
-    let quorum = tracer
-        .combine_and_trace(partials)
+    let (quorum, timings) = tracer
+        .combine_and_trace_timed(partials)
         .map_err(|e| format!("Tracing failed: {}", e))?;
     let duration_partial = start_partial.elapsed();
+    println!("BENCH,ShareDec,{}", share_dec_us);
+    println!("BENCH,ShareVerify,{}", timings.share_verify_us);
+    println!("BENCH,Rec,{}", timings.rec_us);
     println!("BENCH,VerifySign,{}", duration_partial.as_micros());
 
     println!(

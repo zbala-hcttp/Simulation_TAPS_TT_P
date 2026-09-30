@@ -9,5 +9,6 @@ pub mod combiner;
 pub mod crypto;
 pub mod network;
 pub mod signer;
+pub mod trace_bench;
 pub mod tracer;
 pub mod tracer_mesh;
